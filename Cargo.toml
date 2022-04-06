@@ -1,0 +1,13 @@
+[package]
+name = "rwled"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+
+smart-leds = "0.3.0"
+ws2812-spi = { git = "https://github.com/smart-leds-rs/ws2812-spi-rs", branch = "dev/hosted", features = ["std"] }
+rppal = { version = "0.13.1", features = ["hal"] }
