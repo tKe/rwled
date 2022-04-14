@@ -1,5 +1,5 @@
 use std::pin::Pin;
-
+use palette::{Srgb, Hsv, Pixel, IntoColor};
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
 use smart_leds::{SmartLedsWrite, RGB8};
 use tokio::net::UdpSocket;
@@ -12,20 +12,36 @@ struct Strip {
     stream: Ws2812<Spi>,
     leds: [RGB8; NUM_LEDS],
     pending: bool,
+    rainbow: f32,
 }
 
 impl Strip {
     fn set_led(&mut self, idx: usize, c: &[u8]) {
         self.pending = true;
-        self.leds[idx].r = c[0];
-        self.leds[idx].g = c[1];
-        self.leds[idx].b = c[2];
+        if self.rainbow != 0.0 {
+            let mut hsv: Hsv = Srgb::from_raw(c).into_format().into_color();
+            hsv.hue += self.rainbow * (idx as f32 / NUM_LEDS as f32);
+            let rgb: Srgb = hsv.into_color();
+            let out: Srgb<u8> = rgb.into_format();
+
+            self.leds[idx].r = out.red;
+            self.leds[idx].g = out.green;
+            self.leds[idx].b = out.blue;
+        } else {
+            self.leds[idx].r = c[0];
+            self.leds[idx].g = c[1];
+            self.leds[idx].b = c[2];
+        }
+    }
+
+    fn write(&mut self) -> Result<(), <ws2812_spi::hosted::Ws2812<Spi> as SmartLedsWrite>::Error> {
+        self.pending = false;
+        self.stream.write(self.leds.iter().cloned())
     }
 
     fn flush(&mut self) -> Result<(), <ws2812_spi::hosted::Ws2812<Spi> as SmartLedsWrite>::Error> {
         if self.pending {
-            self.stream.write(self.leds.iter().cloned())?;
-            self.pending = false;
+            self.write()?;
         }
         Ok(())
     }
@@ -39,17 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream: Ws2812::new(spi),
         leds: [RGB8::default(); NUM_LEDS],
         pending: false,
+        rainbow: 0.0,
     };
 
     let sock = UdpSocket::bind("0.0.0.0:21324").await?;
     println!("Listening on {:?}", sock.local_addr()?);
     let mut buf = [0; 490 * 3 + 2];
 
-    let mut write_rate = time::interval(time::Duration::from_secs_f64(1.0 / 120.0));
-    write_rate.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut write_interval = time::interval(time::Duration::from_secs(1));
+    let mut flush_interval = time::interval(time::Duration::from_secs_f64(1.0 / 120.0));
+    flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
-    let mut fade_rate = time::interval(time::Duration::from_secs_f64(1.0 / 30.0));
-    fade_rate.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut fade_interval = time::interval(time::Duration::from_secs_f64(1.0 / 30.0));
+    fade_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
     let current_timeout = time::sleep(time::Duration::from_secs(86400));
     tokio::pin!(current_timeout);
@@ -57,21 +75,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             biased;
-            _ = write_rate.tick(), if strip.pending => strip.flush()?,
-            Ok((len, _)) = sock.recv_from(&mut buf) => match buf {
-                [1, timeout, ..] => {
-                    update_timeout(current_timeout.as_mut(), timeout);
-                    update_warls(&mut strip, &buf[2..len]);
+            _ = write_interval.tick() => strip.write()?,
+            _ = flush_interval.tick(), if strip.pending => strip.flush()?,
+            Ok((len, _)) = sock.recv_from(&mut buf) => match &buf[..len] {
+                [mode @ 1..=2, timeout, payload @ ..] => {
+                    update_timeout(current_timeout.as_mut(), *timeout);
+                    match mode {
+                        1 => update_warls(&mut strip, payload),
+                        2 => update_drgb(&mut strip, payload),
+                        _ => (),
+                    }
                 },
-                [2, timeout, ..] => {
-                    update_timeout(current_timeout.as_mut(), timeout);
-                    update_drgb(&mut strip, &buf[2..len]);
-                },
+                b"rainbow" => {
+                    if strip.rainbow > 0.0 {
+                        strip.rainbow = 0.0
+                    } else {
+                        strip.rainbow = 270.0
+                    }
+                    println!("Rainbow: {:?}", strip.rainbow);
+                }
+                [b'r', n] => {
+                    strip.rainbow = 30.0 * (*n as f32);
+                    println!("Rainbow: {:?}", strip.rainbow);
+                }
+                [b'r', d1 @ b'0'..=b'9', d2 @ b'0'..=b'9'] => {
+                    let n = 10 * (d1 - b'0') + (d2 - b'0');
+                    strip.rainbow = 30.0 * (n as f32);
+                    println!("Rainbow: {:?}", strip.rainbow);
+                }
                 _ => println!("Unhandled data type {:?}", buf[0]),
             },
             _ = &mut current_timeout => {
                 tokio::select! {
-                    _ = fade_rate.tick() => {
+                    _ = fade_interval.tick() => {
                         strip.leds.iter_mut()
                         .filter(|led| { led.r > 0 || led.g > 0 || led.b > 0 })
                         .for_each(|led| {
