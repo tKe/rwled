@@ -1,7 +1,8 @@
-use std::pin::Pin;
-use palette::{Srgb, Hsv, Pixel, IntoColor};
+use palette::{Hsv, IntoColor, Srgb};
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
 use smart_leds::{SmartLedsWrite, RGB8};
+use std::ops::Range;
+use std::pin::Pin;
 use tokio::net::UdpSocket;
 use tokio::time::{self, Instant, Sleep};
 use ws2812_spi::hosted::Ws2812;
@@ -17,26 +18,26 @@ struct Strip {
 
 impl Strip {
     fn set_led(&mut self, idx: usize, c: &[u8]) {
+        self.leds[idx].r = c[0];
+        self.leds[idx].g = c[1];
+        self.leds[idx].b = c[2];
         self.pending = true;
-        if self.rainbow != 0.0 {
-            let mut hsv: Hsv = Srgb::from_raw(c).into_format().into_color();
-            hsv.hue += self.rainbow * (idx as f32 / NUM_LEDS as f32);
-            let rgb: Srgb = hsv.into_color();
-            let out: Srgb<u8> = rgb.into_format();
-
-            self.leds[idx].r = out.red;
-            self.leds[idx].g = out.green;
-            self.leds[idx].b = out.blue;
-        } else {
-            self.leds[idx].r = c[0];
-            self.leds[idx].g = c[1];
-            self.leds[idx].b = c[2];
-        }
     }
 
     fn write(&mut self) -> Result<(), <ws2812_spi::hosted::Ws2812<Spi> as SmartLedsWrite>::Error> {
         self.pending = false;
-        self.stream.write(self.leds.iter().cloned())
+
+        if self.rainbow != 0.0 {
+            self.stream.write(self.leds.iter().enumerate().map(|(idx, led)| {
+                let mut hsv: Hsv = Srgb::new(led.r, led.g, led.b).into_format().into_color();
+                hsv.hue += self.rainbow * (idx as f32 / NUM_LEDS as f32);
+                let rgb: Srgb = hsv.into_color();
+                let out: Srgb<u8> = rgb.into_format();
+                RGB8::new(out.red, out.green, out.blue)
+            }))
+        } else {
+            self.stream.write(self.leds.iter().cloned())
+        }
     }
 
     fn flush(&mut self) -> Result<(), <ws2812_spi::hosted::Ws2812<Spi> as SmartLedsWrite>::Error> {
@@ -66,17 +67,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut flush_interval = time::interval(time::Duration::from_secs_f64(1.0 / 120.0));
     flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
-    let mut fade_interval = time::interval(time::Duration::from_secs_f64(1.0 / 30.0));
+    let mut fade_interval = time::interval(time::Duration::from_secs_f64(1.0 / 60.0));
     fade_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
     let current_timeout = time::sleep(time::Duration::from_secs(86400));
     tokio::pin!(current_timeout);
+
+    let mut audvis = false;
+    let mut avleds = [RGB8::default(); NUM_LEDS];
 
     loop {
         tokio::select! {
             biased;
             _ = write_interval.tick() => strip.write()?,
             _ = flush_interval.tick(), if strip.pending => strip.flush()?,
+            _ = fade_interval.tick(), if audvis => {
+                for idx in 0..NUM_LEDS/2 {
+                    avleds[idx] = avleds[idx+1].clone();
+                    fade_led(&mut avleds[idx], 0.001);
+                    avleds[NUM_LEDS - idx - 1] = avleds[idx];
+                }
+                if strip.leds != avleds {
+                    strip.leds.copy_from_slice(&avleds);
+                    strip.pending = true;
+                }
+            },
             Ok((len, _)) = sock.recv_from(&mut buf) => match &buf[..len] {
                 [mode @ 1..=2, timeout, payload @ ..] => {
                     update_timeout(current_timeout.as_mut(), *timeout);
@@ -85,7 +100,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         2 => update_drgb(&mut strip, payload),
                         _ => (),
                     }
+                    if audvis {
+                        let chval = |leds: &[RGB8], range: Range<f32>, mult: f32| {
+                            fn bound(f: f32) -> usize {
+                                if f <= 0.0 {
+                                    0
+                                } else if f >= 1.0 {
+                                    NUM_LEDS
+                                } else {
+                                    (f * NUM_LEDS as f32) as usize
+                                }
+                            }
+                            let r = bound(range.start)..bound(range.end);
+                            let weight = NUM_LEDS as f32 * (range.end - range.start) / mult;
+                            let value = leds[r].iter().map(|l| {
+                                let hsv: palette::Hsl = Srgb::new(l.r, l.g, l.b).into_format().into_color();
+                                hsv.lightness
+                            }).sum::<f32>() / weight;
+
+                            (value * 255.0).min(255.0) as u8
+                        };
+
+                        let ctr = RGB8::new(
+                            chval(&strip.leds, 0.0..0.25, 1.2),
+                            chval(&strip.leds, 0.25..0.50, 0.9),
+                            chval(&strip.leds, 0.50..1.0, 1.0),
+                        );
+                        
+                        avleds[NUM_LEDS/2] = ctr;
+                        strip.leds.copy_from_slice(&avleds);
+                    }
                 },
+                b"audvis" => {
+                    audvis ^= true;
+                    println!("AudVis: {:?}", audvis);
+                }
                 b"rainbow" => {
                     if strip.rainbow > 0.0 {
                         strip.rainbow = 0.0
@@ -111,9 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         strip.leds.iter_mut()
                         .filter(|led| { led.r > 0 || led.g > 0 || led.b > 0 })
                         .for_each(|led| {
-                            if led.r > 0 { led.r -= u8::max(1, (led.r as f32 * 0.10) as u8) }
-                            if led.g > 0 { led.g -= u8::max(1, (led.g as f32 * 0.10) as u8) }
-                            if led.b > 0 { led.b -= u8::max(1, (led.b as f32 * 0.10) as u8) }
+                            fade_led(led, 0.10);
                             strip.pending = true
                         });
 
@@ -124,6 +171,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
         }
+    }
+}
+
+fn fade_led(led: &mut RGB8, factor: f32) {
+    if factor <= 0.0 { return }
+    if led.r > 0 {
+        led.r -= 1.max((led.r as f32 * factor) as u8)
+    }
+    if led.g > 0 {
+        led.g -= 1.max((led.g as f32 * factor) as u8)
+    }
+    if led.b > 0 {
+        led.b -=  1.max((led.b as f32 * factor) as u8)
     }
 }
 
