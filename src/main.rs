@@ -3,6 +3,7 @@ use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
 use smart_leds::{SmartLedsWrite, RGB8};
 use std::ops::Range;
 use std::pin::Pin;
+use std::str::FromStr;
 use tokio::net::UdpSocket;
 use tokio::time::{self, Instant, Sleep};
 use ws2812_spi::hosted::Ws2812;
@@ -28,23 +29,17 @@ impl Strip {
         self.pending = false;
 
         if self.rainbow != 0.0 {
-            self.stream.write(self.leds.iter().enumerate().map(|(idx, led)| {
-                let mut hsv: Hsv = Srgb::new(led.r, led.g, led.b).into_format().into_color();
-                hsv.hue += self.rainbow * (idx as f32 / NUM_LEDS as f32);
-                let rgb: Srgb = hsv.into_color();
-                let out: Srgb<u8> = rgb.into_format();
-                RGB8::new(out.red, out.green, out.blue)
-            }))
+            self.stream
+                .write(self.leds.iter().enumerate().map(|(idx, led)| {
+                    let mut hsv: Hsv = Srgb::new(led.r, led.g, led.b).into_format().into_color();
+                    hsv.hue += self.rainbow * (idx as f32 / NUM_LEDS as f32);
+                    let rgb: Srgb = hsv.into_color();
+                    let out: Srgb<u8> = rgb.into_format();
+                    RGB8::new(out.red, out.green, out.blue)
+                }))
         } else {
             self.stream.write(self.leds.iter().cloned())
         }
-    }
-
-    fn flush(&mut self) -> Result<(), <ws2812_spi::hosted::Ws2812<Spi> as SmartLedsWrite>::Error> {
-        if self.pending {
-            self.write()?;
-        }
-        Ok(())
     }
 }
 
@@ -70,6 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fade_interval = time::interval(time::Duration::from_secs_f64(1.0 / 60.0));
     fade_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
+    let mut proxy_interval = time::interval(time::Duration::from_secs_f64(1.0 / 20.0));
+    proxy_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let proxy: Option<std::net::SocketAddr> = Some(std::net::SocketAddr::V4(
+        std::net::SocketAddrV4::from_str("192.168.12.76:21324")?,
+    ));
+
     let current_timeout = time::sleep(time::Duration::from_secs(86400));
     tokio::pin!(current_timeout);
 
@@ -79,12 +80,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             biased;
-            _ = write_interval.tick() => strip.write()?,
-            _ = flush_interval.tick(), if strip.pending => strip.flush()?,
+            _ = write_interval.tick() => strip.pending = true,
+            _ = flush_interval.tick(), if strip.pending => {
+                strip.write()?;
+                match proxy {
+                    Some(dest) => {
+                        let mut pxybuf = [u8::default(); 2 + 15 * 3];
+                        let srcleds = &strip.leds[30..NUM_LEDS-30];
+                        pxybuf[0] = 2;
+                        pxybuf[1] = 5;
+                        pxybuf[2..].iter_mut().zip(
+                            srcleds.chunks(srcleds.len() / 15)
+                                .map(|leds| {
+                                    leds.iter().fold([0 as f32;3], |mut out, led| {
+                                        out[0] += led.r as f32;
+                                        out[1] += led.g as f32;
+                                        out[2] += led.b as f32;
+                                        out
+                                    }).map(|c| (c / leds.len() as f32) as u8)
+                                })
+                                .flatten()
+                        ).for_each(|(dst, itm)| *dst = itm);
+                        sock.send_to(&pxybuf, dest).await?;
+                    }
+                    _ => ()
+                }
+            },
             _ = fade_interval.tick(), if audvis => {
                 for idx in 0..NUM_LEDS/2 {
                     avleds[idx] = avleds[idx+1].clone();
-                    fade_led(&mut avleds[idx], 0.001);
+                    if idx % 2 == 0 {
+                        fade_led(&mut avleds[idx], 0.001);
+                    }
                     avleds[NUM_LEDS - idx - 1] = avleds[idx];
                 }
                 if strip.leds != avleds {
@@ -112,10 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             let r = bound(range.start)..bound(range.end);
-                            let weight = NUM_LEDS as f32 * (range.end - range.start) / mult;
+                            let weight = (r.end - r.start) as f32 / mult;
                             let value = leds[r].iter().map(|l| {
-                                let hsv: palette::Hsl = Srgb::new(l.r, l.g, l.b).into_format().into_color();
-                                hsv.lightness
+                                let hsl: palette::Hsl = Srgb::new(l.r, l.g, l.b).into_format().into_color();
+                                hsl.lightness
                             }).sum::<f32>() / weight;
 
                             (value * 255.0).min(255.0) as u8
@@ -126,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             chval(&strip.leds, 0.25..0.50, 0.9),
                             chval(&strip.leds, 0.50..1.0, 1.0),
                         );
-                        
+
                         avleds[NUM_LEDS/2] = ctr;
                         strip.leds.copy_from_slice(&avleds);
                     }
@@ -175,7 +202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn fade_led(led: &mut RGB8, factor: f32) {
-    if factor <= 0.0 { return }
+    if factor <= 0.0 {
+        return;
+    }
     if led.r > 0 {
         led.r -= 1.max((led.r as f32 * factor) as u8)
     }
@@ -183,7 +212,7 @@ fn fade_led(led: &mut RGB8, factor: f32) {
         led.g -= 1.max((led.g as f32 * factor) as u8)
     }
     if led.b > 0 {
-        led.b -=  1.max((led.b as f32 * factor) as u8)
+        led.b -= 1.max((led.b as f32 * factor) as u8)
     }
 }
 
