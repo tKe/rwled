@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "type": "cargo",
+            "name": "build",
+            "environment": {
+
+          }, // optional
+            "dependsOn": [], // optional
+            "cargoArgs": [], // optional
+            "cargoExtraArgs": ["b"], // optional
+            "executableArgs": [], // optional
+        }
+      ,
+      {
+        "type": "cargo",
+        "name": "fmt",
+        "cargoExtraArgs": ["fmt"],
+      }
+,
+      {"type": "command",
+      "name": "run pi",
+      "program": "./run.sh",}
+    ]
+}
