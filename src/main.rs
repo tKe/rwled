@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     let target = StripTransport::composite(vec![
         transport("spi", leds).await?,
         transport("wled", leds).await?,
-        //    transport("study", leds).await?,
+        //transport("study", leds).await?,
     ]);
 
     println!("Setting up strip for {:?}", target);
@@ -154,8 +154,8 @@ async fn main() -> Result<()> {
 
                     match mode {
                         1 => update_warls(&mut strip, payload),
-                    2 => update_drgb(&mut strip, payload),
-                    _ => (),
+                        2 => update_drgb(&mut strip, payload),
+                        _ => println!("warn: unknown data mode {}", mode),
                     }
 
                     if audvis {
@@ -191,6 +191,20 @@ async fn main() -> Result<()> {
                     }
                     println!("Warned!");
                 }
+                b"hue" => {
+                    if let StripTransport::Composite(mut targets) = strip.stream {
+                        let has_hue = targets.iter().any(is_hue);
+
+                        println!("targets(hue? {}): {:?}", has_hue, targets);
+                        if has_hue {
+                            targets.retain(|target| !is_hue(target));
+                        } else {
+                            targets.push(transport("study", 1).await?);
+                        }
+                        strip.stream = StripTransport::composite(targets);
+                    }
+                    println!("-> targets: {:?}", strip.stream);
+                }
                 b"audvis" => {
                     audvis ^= true;
                     if audvis { avfact = AVFACT_MIN; }
@@ -213,7 +227,7 @@ async fn main() -> Result<()> {
                     strip.rainbow = 30.0 * (n as f32);
                     println!("Rainbow: {:?}", strip.rainbow);
                 }
-                _ => println!("Unhandled data type {:?}", buf[0]),
+                unhandled => println!("Unhandled data: {:?}", unhandled),
             },
             _ = &mut current_timeout => {
                 tokio::select! {
@@ -230,6 +244,14 @@ async fn main() -> Result<()> {
                 }
             },
         }
+    }
+}
+
+fn is_hue(target: &StripTransport) -> bool {
+    if let StripTransport::Sampled(s) = target {
+        matches!(s.base.as_ref(), StripTransport::Hue(_))
+    } else {
+        matches!(target, StripTransport::Hue(_))
     }
 }
 

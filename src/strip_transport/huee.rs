@@ -13,9 +13,32 @@ pub struct Hue {
     hub_ip: String,
     username: String,
     clientkey: String,
+    group: u16,
     lights: Vec<u16>,
     dtls_conn: Option<Arc<dyn Conn + Send + Sync>>,
     buf: [u8; 106],
+}
+
+impl Drop for Hue {
+    fn drop(&mut self) {
+        let group_url = format!(
+            "https://{}/api/{}/groups/{}",
+            self.hub_ip, self.username, self.group
+        );
+        let desc = self.desc.clone();
+        tokio::spawn(async move {
+            println!("disconnecting from {}", desc);
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap()
+                .put(&group_url)
+                .body("{\"stream\":{\"active\":false}}")
+                .send()
+                .await
+                .ok()
+        });
+    }
 }
 
 impl Hue {
@@ -30,14 +53,14 @@ impl Hue {
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap();
-        let res = client
+
+        client
             .put(&group_url)
             .body("{\"stream\":{\"active\":true}}")
             .send()
             .await?
             .text()
             .await?;
-        println!("active:{:?}", res);
 
         let grp = client
             .get(&group_url)
@@ -45,16 +68,15 @@ impl Hue {
             .await?
             .json::<serde_json::Value>()
             .await?;
-        println!("group: {:?}", grp);
 
         let lights: Vec<u16> = Self::get_lights(grp).unwrap();
-        println!("lights: {:?}", lights);
 
         let mut hue = Hue {
             desc: format!("{}/{}{:?}", hub_ip, group, lights),
             hub_ip: String::from(hub_ip),
             username: String::from(username),
             clientkey: String::from(clientkey),
+            group,
             lights,
             dtls_conn: None,
             buf: [0; 106],

@@ -36,7 +36,7 @@ impl std::fmt::Debug for StripTransport {
 }
 
 pub(crate) struct SampledStripTransport {
-    base: Box<StripTransport>,
+    pub(crate) base: Box<StripTransport>,
     range: Range<usize>,
     count: usize,
 }
@@ -141,8 +141,8 @@ impl StripTransport {
 
     pub(crate) fn sample(self, range: Range<usize>, count: usize) -> Self {
         match self {
-            StripTransport::Composite(_) => panic!("not permitted"),
-            StripTransport::Sampled(_) => panic!("not permitted"),
+            StripTransport::Composite(_) => panic!("Cannot nest composite transport in sampled"),
+            StripTransport::Sampled(_) => panic!("Cannot nest sampled transport in sampled"),
             _ => Self::Sampled(SampledStripTransport {
                 base: Box::new(self),
                 range,
