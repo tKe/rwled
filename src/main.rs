@@ -1,22 +1,48 @@
 use palette::{Hsv, IntoColor, Srgb};
-use rgb::{ComponentMap, FromSlice};
-use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
-use smart_leds::{SmartLedsWrite, RGB, RGB8};
+use rgb::ComponentMap;
+use rgb::FromSlice;
+use smart_leds::{RGB, RGB8};
+use std::net::AddrParseError;
 use std::ops::Range;
 use std::pin::Pin;
-use std::str::FromStr;
+use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::{self, Instant, Sleep};
-use ws2812_spi::hosted::Ws2812;
 
-const NUM_LEDS: usize = 105;
-const DBGIMG_W: u32 = 1576;
 const AVFACT_MIN: f32 = 1_f32;
 const AVFACT_MAX: f32 = 3_f32;
+const HUE_HUBIP: &str = "192.168.12.49";
+const HUE_USERNAME: &str = "";
+const HUE_CLIENTKEY: &str = "";
+
+type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Error, Debug)]
+pub(crate) enum Error {
+    #[error("SPI Error")]
+    SpiError(#[from] rppal::spi::Error),
+    #[error("IO Error")]
+    IOError(#[from] std::io::Error),
+    #[error("Format Error")]
+    FormatError(#[from] std::fmt::Error),
+    #[error("Image Error")]
+    ImageError(#[from] image::ImageError),
+    #[error("Image Error")]
+    ParseError(#[from] AddrParseError),
+    #[error("Reqwest Error")]
+    ReqweestError(#[from] reqwest::Error),
+    #[error("WebRTC Error")]
+    WebRTCError(#[from] webrtc_dtls::Error),
+    #[error("WebRTC Error")]
+    WebRTCUtilError(#[from] webrtc_util::Error),
+}
+
+mod strip_transport;
+use strip_transport::StripTransport;
 
 struct Strip {
-    stream: Ws2812<Spi>,
-    leds: [RGB<f32>; NUM_LEDS],
+    stream: StripTransport,
+    leds: Vec<RGB<f32>>,
     pending: bool,
     rainbow: f32,
 }
@@ -28,36 +54,66 @@ impl Strip {
         self.pending = true;
     }
 
-    fn write(&mut self) -> Result<(), <ws2812_spi::hosted::Ws2812<Spi> as SmartLedsWrite>::Error> {
+    async fn write(&mut self) -> Result<()> {
         self.pending = false;
 
         if self.rainbow != 0.0 {
             self.stream
                 .write(self.leds.iter().enumerate().map(|(idx, led)| {
                     let mut hsv: Hsv = Srgb::new(led.r, led.g, led.b).into_format().into_color();
-                    hsv.hue += self.rainbow * (idx as f32 / NUM_LEDS as f32);
+                    hsv.hue += self.rainbow * (idx as f32 / self.leds.len() as f32);
                     let rgb: Srgb = hsv.into_color();
                     let out: Srgb<u8> = rgb.into_format();
                     RGB8::new(out.red, out.green, out.blue)
                 }))
+                .await
         } else {
             self.stream
                 .write(self.leds.iter().map(|c| c.map(|ch| ch as u8)))
+                .await
         }
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let spi = Spi::new(Bus::Spi0, SlaveSelect::Ss0, 3_000_000, Mode::Mode0)?;
+async fn main() -> Result<()> {
+    let leds: u32 = 105;
+
+    async fn transport(mode: &str, leds: u32) -> Result<StripTransport> {
+        Ok(match mode {
+            "spi" => StripTransport::ws2812()?,
+            "wled" => StripTransport::udp_str("192.168.12.76:21324")
+                .await?
+                .sample(30..75, 15),
+            "rpi" => StripTransport::udp_str("192.168.12.75:21324").await?,
+            "dbg" => StripTransport::debug_image(1024, leds as u32),
+
+            "study" => StripTransport::hue(HUE_HUBIP, HUE_USERNAME, HUE_CLIENTKEY, 7)
+                .await?
+                .sample(40..65, 1),
+
+            "bathroom" => StripTransport::hue(HUE_HUBIP, HUE_USERNAME, HUE_CLIENTKEY, 200)
+                .await?
+                .sample(30..75, 4),
+
+            "conservatory" => StripTransport::hue(HUE_HUBIP, HUE_USERNAME, HUE_CLIENTKEY, 201)
+                .await?
+                .sample(30..75, 8),
+            _ => panic!("unknown"),
+        })
+    }
+
+    let target = StripTransport::composite(vec![
+        transport("spi", leds).await?,
+        transport("wled", leds).await?,
+        //transport("study", leds).await?,
+    ]);
+
+    println!("Setting up strip for {:?}", target);
 
     let mut strip = Strip {
-        stream: Ws2812::new(spi),
-        leds: [RGB {
-            r: 0_f32,
-            g: 0.,
-            b: 0.,
-        }; NUM_LEDS],
+        stream: target,
+        leds: vec![RGB::<f32>::default(); leds as usize],
         pending: false,
         rainbow: 0.0,
     };
@@ -67,41 +123,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0; 490 * 3 + 2];
 
     let mut write_interval = time::interval(time::Duration::from_secs(1));
-    let mut flush_interval = time::interval(time::Duration::from_secs_f64(1.0 / 120.0));
+    let mut flush_interval = time::interval(time::Duration::from_secs_f64(1.0 / 60.0));
     flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
     let mut fade_interval = time::interval(time::Duration::from_secs_f64(1.0 / 60.0));
     fade_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
-    let mut proxy_interval = time::interval(time::Duration::from_secs_f64(1.0 / 20.0));
-    proxy_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let proxy: Option<std::net::SocketAddr> = Some(std::net::SocketAddr::V4(
-        std::net::SocketAddrV4::from_str("192.168.12.76:21324")?,
-    ));
-
     let current_timeout = time::sleep(time::Duration::from_secs(86400));
     tokio::pin!(current_timeout);
 
     let mut audvis = false;
-    let mut avleds = [<RGB<f32>>::default(); NUM_LEDS];
+    let mut avleds = vec![<RGB<f32>>::default(); strip.leds.len()];
     let mut avfact = 0_f32;
-
-    let dbg = false;
-    let mut dbgimg = image::RgbImage::new(DBGIMG_W, NUM_LEDS as u32);
-    let mut dbgimg_y = 0;
-    let mut dbgimg_n = 0;
 
     loop {
         tokio::select! {
             biased;
             _ = write_interval.tick() => strip.pending = true,
-            _ = flush_interval.tick(), if strip.pending => {
-                strip.write()?;
-                match proxy {
-                    Some(dest) => proxy_strip(&strip, &sock, dest).await?,
-                _ => ()
-                }
-            },
+            _ = flush_interval.tick(), if strip.pending => strip.write().await?,
             _ = fade_interval.tick(), if audvis => {
                 audvis_tick(&mut avleds);
                 if strip.leds != avleds {
@@ -116,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match mode {
                         1 => update_warls(&mut strip, payload),
                         2 => update_drgb(&mut strip, payload),
-                        _ => (),
+                        _ => println!("warn: unknown data mode {}", mode),
                     }
 
                     if audvis {
@@ -125,20 +164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         fade_interval.reset();
                         strip.leds.copy_from_slice(&avleds);
                     }
-
-                    if dbg {
-                        strip.leds.iter().enumerate()
-                            .for_each(|(i, l)| dbgimg.put_pixel(dbgimg_y, i as u32, image::Rgb([l.r as u8, l.g as u8, l.b as u8])));
-                        dbgimg_y = (dbgimg_y + 1) % DBGIMG_W;
-                        if dbgimg_y == 0 {
-                            let file = &format!("dbg/dbg-{:03}.png", dbgimg_n);
-                            dbgimg.save(file)?;
-                            println!("Saved {}", file);
-                            dbgimg_n += 1;
-                        }
-                 }
-            },
-            b"warn" => {
+                },
+                b"warn" => {
                     strip.leds.iter_mut()
                         .for_each(|led| {
                             led.r = 0.;
@@ -149,24 +176,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     loop {
                         tokio::select! {
                             _ = flush_interval.tick(), if strip.pending => {
-                                strip.write()?;
-                                match proxy {
-                                    Some(dest) => proxy_strip(&strip, &sock, dest).await?,
-                                _ => ()
-                                }
+                                strip.write().await?;
                             },
                         _ = fade_interval.tick() => {
                                 strip.leds.iter_mut()
-                                    .filter(|led| led.iter().any(|f| f >= 10.) )
+                        .filter(|led| led.iter().any(|f| f >= 10.) )
                                     .for_each(|led| {
                                         strip.pending |= fade_led(led, 0.10)
                                     });
                                 if !strip.pending { break }
-                                strip.write()?;
+                                strip.write().await?;
                             }
                         }
                     }
                     println!("Warned!");
+                }
+                b"hue" => {
+                    if let StripTransport::Composite(mut targets) = strip.stream {
+                        let has_hue = targets.iter().any(is_hue);
+
+                        println!("targets(hue? {}): {:?}", has_hue, targets);
+                        if has_hue {
+                            targets.retain(|target| !is_hue(target));
+                        } else {
+                            targets.push(transport("study", 1).await?);
+                        }
+                        strip.stream = StripTransport::composite(targets);
+                    }
+                    println!("-> targets: {:?}", strip.stream);
                 }
                 b"audvis" => {
                     audvis ^= true;
@@ -190,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     strip.rainbow = 30.0 * (n as f32);
                     println!("Rainbow: {:?}", strip.rainbow);
                 }
-                _ => println!("Unhandled data type {:?}", buf[0]),
+                unhandled => println!("Unhandled data: {:?}", unhandled),
             },
             _ = &mut current_timeout => {
                 tokio::select! {
@@ -210,35 +247,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn proxy_strip(
-    strip: &Strip,
-    sock: &UdpSocket,
-    dest: std::net::SocketAddr,
-) -> Result<(), std::io::Error> {
-    let mut pxybuf = [u8::default(); 2 + 15 * 3];
-    let srcleds = &strip.leds[30..NUM_LEDS - 30];
-    pxybuf[0] = 2;
-    pxybuf[1] = 5;
-    pxybuf[2..]
-        .iter_mut()
-        .zip(
-            srcleds
-                .chunks(srcleds.len() / 15)
-                .map(|leds| {
-                    leds.iter()
-                        .fold([0_f32; 3], |mut out, led| {
-                            out[0] += led.r;
-                            out[1] += led.g;
-                            out[2] += led.b;
-                            out
-                        })
-                        .map(|c| (c / leds.len() as f32) as u8)
-                })
-                .flatten(),
-        )
-        .for_each(|(dst, itm)| *dst = itm);
-    sock.send_to(&pxybuf, dest).await?;
-    Ok(())
+fn is_hue(target: &StripTransport) -> bool {
+    if let StripTransport::Sampled(s) = target {
+        matches!(s.base.as_ref(), StripTransport::Hue(_))
+    } else {
+        matches!(target, StripTransport::Hue(_))
+    }
 }
 
 fn fade_led(led: &mut RGB<f32>, factor: f32) -> bool {
@@ -280,7 +294,7 @@ fn ratio_range(range: Range<f32>, length: usize) -> Range<usize> {
         if f <= 0.0 {
             0
         } else if f >= 1.0 {
-            NUM_LEDS
+            length
         } else {
             (f * length as f32) as usize
         }
@@ -290,7 +304,7 @@ fn ratio_range(range: Range<f32>, length: usize) -> Range<usize> {
 
 fn audvis_process(rawleds: &[RGB<f32>], avleds: &mut [RGB<f32>], avfact: &mut f32) {
     let chval = |leds: &[RGB<f32>], range: Range<f32>| {
-        let r = ratio_range(range, NUM_LEDS);
+        let r = ratio_range(range, rawleds.len());
         let weight = (r.end - r.start) as f32;
         leds[r].iter().map(|l| l.r).sum::<f32>() / weight
     };
@@ -305,13 +319,14 @@ fn audvis_process(rawleds: &[RGB<f32>], avleds: &mut [RGB<f32>], avfact: &mut f3
     let chmax = 255_f32 / ctr.iter().reduce(f32::max).unwrap_or_default();
     *avfact = avfact.min(chmax).clamp(AVFACT_MIN, AVFACT_MAX);
 
-    avleds[NUM_LEDS / 2] = ctr;
+    avleds[rawleds.len() / 2] = ctr;
 }
 
 fn audvis_tick(avleds: &mut [RGB<f32>]) {
-    for idx in 0..NUM_LEDS / 2 {
+    let l = avleds.len();
+    for idx in 0..l / 2 {
         avleds[idx] = avleds[idx + 1].clone();
-        fade_led(&mut avleds[idx], 0.02);
-        avleds[NUM_LEDS - idx - 1] = avleds[idx];
+        fade_led(&mut avleds[idx], 1.0 / (l) as f32);
+        avleds[avleds.len() - idx - 1] = avleds[idx];
     }
 }
